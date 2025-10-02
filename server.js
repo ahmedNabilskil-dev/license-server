@@ -7,7 +7,6 @@ const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const nodemailer = require("nodemailer");
 require("dotenv").config();
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -755,24 +754,30 @@ const sendCancellationEmail = async (email, customerName = "") => {
 app.post(
   "/webhook/paddle",
   express.raw({ type: "application/json" }),
-  (req, res) => {
+  async (req, res) => {
     try {
       const signatureHeader = req.headers["paddle-signature"];
-      const rawBody = req.body.toString("utf8"); // req.body is Buffer here
+      const rawBody = req.body.toString("utf8");
+      const secretKey = process.env.PADDLE_NOTIFICATION_SECRET;
 
-      if (!verifyWebhookSignature(signatureHeader, rawBody)) {
-        return res.status(401).json({ error: "Invalid signature" });
+      if (!signatureHeader || !rawBody) {
+        return res.status(400).json({ error: "Missing signature or body" });
       }
 
-      const event = JSON.parse(rawBody);
-      console.log("✅ Webhook verified:", event.event_type);
+      const eventData = await paddle.webhooks.unmarshal(
+        rawBody,
+        secretKey,
+        signatureHeader
+      );
 
-      handleWebhookEvent(event); // your custom handler
+      console.log("✅ Webhook verified:", eventData.eventType);
+
+      handleWebhookEvent(eventData);
 
       res.status(200).json({ received: true });
     } catch (error) {
-      console.error("❌ Webhook error:", error);
-      res.status(500).json({ error: "Webhook processing failed" });
+      console.error("❌ Webhook error:", error.message);
+      res.status(200).json({ error: "Webhook processing failed" });
     }
   }
 );
