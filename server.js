@@ -45,7 +45,7 @@ app.use(
     credentials: true,
   })
 );
-
+app.set("trust proxy", 1);
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -54,8 +54,6 @@ const limiter = rateLimit({
 });
 app.use(limiter);
 
-// Body parsing
-app.use("/webhook/paddle", express.raw({ type: "application/json" }));
 app.use(express.json());
 
 // Utility functions
@@ -83,56 +81,37 @@ function verifyWebhookSignature(signatureHeader, rawBody) {
       return false;
     }
 
-    // Paddle-Signature format: ts=<timestamp>;v1=<signature>
-    const parts = signatureHeader.split(";");
-    if (parts.length !== 2) {
-      console.error("Invalid Paddle-Signature format");
+    // Parse key=value pairs
+    const parts = Object.fromEntries(
+      signatureHeader.split(";").map((p) => p.split("="))
+    );
+    const { t: timestamp, v1: signatureHex } = parts;
+
+    if (!timestamp || !signatureHex) {
+      console.error("Invalid Paddle-Signature format", parts);
       return false;
     }
 
-    const timestamp = parts[0].split("=")[1];
-    const signature = parts[1].split("=")[1];
-
-    if (!timestamp || !signature) {
-      console.error("Invalid Paddle-Signature parts");
-      return false;
-    }
-
-    // Check timestamp freshness (optional but strongly recommended)
-    const timestampMs = parseInt(timestamp, 10) * 1000;
-    if (isNaN(timestampMs)) {
-      console.error("Invalid timestamp");
-      return false;
-    }
-
-    const now = Date.now();
-    if (now - timestampMs > 5000) {
-      console.error("Expired webhook event");
+    // Freshness check (5 minutes)
+    const now = Math.floor(Date.now() / 1000);
+    if (now - parseInt(timestamp, 10) > 300) {
+      console.error("Expired webhook (older than 5 min)");
       return false;
     }
 
     // Reconstruct signed payload
     const signedPayload = `${timestamp}:${rawBody}`;
 
-    // Compute expected signature
+    // Compute expected signature with your notification secret
     const expectedSignature = crypto
-      .createHmac("sha256", process.env.PADDLE_WEBHOOK_SECRET)
+      .createHmac("sha256", process.env.PADDLE_NOTIFICATION_SECRET) // <- your pdl_ntfset_... key
       .update(signedPayload, "utf8")
       .digest("hex");
 
-    // Compare signatures safely
-    const signatureBuf = Buffer.from(signature, "hex");
-    const expectedBuf = Buffer.from(expectedSignature, "hex");
-
-    if (
-      signatureBuf.length !== expectedBuf.length ||
-      !crypto.timingSafeEqual(signatureBuf, expectedBuf)
-    ) {
-      console.error("Invalid signature (mismatch)");
-      return false;
-    }
-
-    return true;
+    return crypto.timingSafeEqual(
+      Buffer.from(signatureHex, "hex"),
+      Buffer.from(expectedSignature, "hex")
+    );
   } catch (err) {
     console.error("Signature verification failed:", err.message);
     return false;
@@ -773,28 +752,30 @@ const sendCancellationEmail = async (email, customerName = "") => {
 };
 
 // Paddle Webhook Handler
-app.post("/webhook/paddle", async (req, res) => {
-  let event;
+app.post(
+  "/webhook/paddle",
+  express.raw({ type: "application/json" }),
+  (req, res) => {
+    try {
+      const signatureHeader = req.headers["paddle-signature"];
+      const rawBody = req.body.toString("utf8"); // req.body is Buffer here
 
-  try {
-    const signature = req.headers["paddle-signature"];
-    const rawBody = req.body.toString(); // make sure body parser doesn’t JSON-parse automatically
+      if (!verifyWebhookSignature(signatureHeader, rawBody)) {
+        return res.status(401).json({ error: "Invalid signature" });
+      }
 
-    if (!verifyWebhookSignature(signature, rawBody)) {
-      return res.status(401).json({ error: "Invalid signature" });
+      const event = JSON.parse(rawBody);
+      console.log("✅ Webhook verified:", event.event_type);
+
+      handleWebhookEvent(event); // your custom handler
+
+      res.status(200).json({ received: true });
+    } catch (error) {
+      console.error("❌ Webhook error:", error);
+      res.status(500).json({ error: "Webhook processing failed" });
     }
-
-    event = JSON.parse(req.body.toString());
-    console.log("Webhook received:", event.event_type);
-
-    await handleWebhookEvent(event);
-
-    res.status(200).json({ received: true });
-  } catch (error) {
-    console.error("Webhook error:", error);
-    res.status(500).json({ error: "Webhook processing failed" });
   }
-});
+);
 
 // Webhook Event Handler
 async function handleWebhookEvent(event) {
@@ -896,7 +877,11 @@ async function cancelPreviousSubscriptions(customerEmail, newSubscriptionId) {
     // Don't throw - allow new subscription to proceed even if cancellation fails
   }
 }
-
+function safeDate(value) {
+  if (!value) return null;
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
 async function handleSubscriptionCreated(subscription) {
   try {
     // Cancel any existing active subscriptions for this customer
@@ -906,26 +891,27 @@ async function handleSubscriptionCreated(subscription) {
     );
 
     const isTrial = subscription.status === "trialing";
+
     const expiresAt = isTrial
-      ? new Date(subscription.trial_ends_at)
-      : new Date(subscription.next_billed_at);
+      ? safeDate(subscription.trial_ends_at)
+      : safeDate(subscription.next_billed_at);
 
     const licenseKey = await createLicense({
       type: "subscription",
       customerEmail: subscription.customer_email,
       customerName: subscription.customer_name,
       subscriptionId: subscription.id,
-      expiresAt: expiresAt,
+      expiresAt: expiresAt, // now safe (may be null)
       maxActivations: 3,
       isTrial: isTrial,
       status: "active",
     });
 
     console.log(
-      `Subscription license created for ${subscription.customer_email}`
+      `✅ Subscription license created for ${subscription.customer_email}`
     );
   } catch (error) {
-    console.error("Subscription created error:", error);
+    console.error("❌ Subscription created error:", error);
   }
 }
 
@@ -942,16 +928,16 @@ async function handleSubscriptionUpdated(subscription) {
         status: subscription.status === "active" ? "active" : "inactive",
       };
 
-      if (subscription.next_billed_at) {
-        updates.expires_at = new Date(
-          subscription.next_billed_at
-        ).toISOString();
+      // safely update expires_at if present
+      const nextBilling = safeDate(subscription.next_billed_at);
+      if (nextBilling) {
+        updates.expires_at = nextBilling;
       }
 
       await supabase.from("licenses").update(updates).eq("id", license.id);
     }
   } catch (error) {
-    console.error("Subscription updated error:", error);
+    console.error("❌ Subscription updated error:", error);
   }
 }
 
@@ -964,8 +950,10 @@ async function handleSubscriptionCanceled(subscription) {
         canceled_at: new Date().toISOString(),
       })
       .eq("subscription_id", subscription.id);
+
+    console.log(`⚠️ Subscription canceled for ${subscription.customer_email}`);
   } catch (error) {
-    console.error("Subscription canceled error:", error);
+    console.error("❌ Subscription canceled error:", error);
   }
 }
 
@@ -975,8 +963,10 @@ async function handleSubscriptionPaymentFailed(subscription) {
       .from("licenses")
       .update({ status: "past_due" })
       .eq("subscription_id", subscription.id);
+
+    console.log(`⚠️ Payment failed for ${subscription.customer_email}`);
   } catch (error) {
-    console.error("Subscription payment failed error:", error);
+    console.error("❌ Subscription payment failed error:", error);
   }
 }
 
@@ -992,10 +982,12 @@ async function handleTransactionCompleted(transaction) {
         status: "active",
       });
 
-      console.log(`One-time license created for ${transaction.customer_email}`);
+      console.log(
+        `✅ One-time license created for ${transaction.customer_email}`
+      );
     }
   } catch (error) {
-    console.error("Transaction completed error:", error);
+    console.error("❌ Transaction completed error:", error);
   }
 }
 
