@@ -18,12 +18,13 @@ const supabase = createClient(
 );
 
 // Email transporter
-const transporter = nodemailer.createTransport({
-  host: "smtp-relay.brevo.com",
-  port: 587,
+const emailTransporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  port: process.env.SMTP_PORT,
+  secure: false, // use TLS
   auth: {
-    user: process.env.BREVO_USER, // usually your Brevo login/email
-    pass: process.env.BREVO_PASS, // your SMTP key from Brevo
+    user: process.env.SMTP_USER,
+    pass: process.env.SMTP_PASS,
   },
 });
 
