@@ -1,11 +1,10 @@
 import { createClient } from "@supabase/supabase-js";
 import cors from "cors";
-import { createHmac, timingSafeEqual } from "crypto";
+import crypto, { createHmac, timingSafeEqual } from "crypto";
 import dotenv from "dotenv";
 import express from "express";
 import rateLimit from "express-rate-limit";
 import helmet from "helmet";
-import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 
 // Load env vars
@@ -159,22 +158,29 @@ app.post(
 
 app.use(express.json());
 
-// Utility functions
-const generateLicenseKey = (licenseId, type, expiryDate) => {
-  const licenseData = {
-    licenseId,
-    type,
-    issuedAt: new Date().toISOString(),
-    expiryDate: expiryDate ? expiryDate : null,
-    features: {
-      aiGeneration: true,
-      premiumTemplates: true,
-      advancedExport: type !== "trial",
-      watermark: type === "trial",
-    },
-  };
+// License Key Generation
+const generateLicenseKey = () => {
+  const characters = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const segments = 4;
+  const segmentLength = 4;
 
-  return jwt.sign(licenseData, process.env.LICENSE_SECRET);
+  let key = "";
+
+  for (let i = 0; i < segments; i++) {
+    for (let j = 0; j < segmentLength; j++) {
+      const randomIndex = crypto.randomInt(0, characters.length);
+      key += characters[randomIndex];
+    }
+    if (i < segments - 1) {
+      key += "-";
+    }
+  }
+
+  return key;
+};
+
+const hashLicenseKey = (licenseKey) => {
+  return crypto.createHash("sha256").update(licenseKey).digest("hex");
 };
 
 const sendLicenseEmail = async (
@@ -209,6 +215,7 @@ const sendLicenseEmail = async (
           body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
           .container { max-width: 600px; margin: 0 auto; padding: 20px; }
           .license-box { background: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0; }
+          .license-key { font-size: 24px; font-weight: bold; letter-spacing: 2px; color: #007bff; }
           .button { display: inline-block; padding: 12px 24px; background: #007bff; color: white; 
                    text-decoration: none; border-radius: 5px; margin: 10px 0; }
         </style>
@@ -224,7 +231,7 @@ const sendLicenseEmail = async (
           
           <div class="license-box">
             <strong>License Key:</strong><br>
-            <code style="font-size: 18px; letter-spacing: 1px;">${licenseKey}</code>
+            <div class="license-key">${licenseKey}</div>
           </div>
 
           <h3>Next Steps:</h3>
@@ -294,6 +301,7 @@ app.get("/health", (req, res) => {
 app.post("/api/activate", async (req, res) => {
   try {
     const { licenseKey, deviceId, deviceInfo } = req.body;
+
     if (!licenseKey || !deviceId) {
       return res.status(400).json({
         success: false,
@@ -301,28 +309,22 @@ app.post("/api/activate", async (req, res) => {
       });
     }
 
-    // Verify license signature
-    let licenseData;
-    try {
-      licenseData = jwt.verify(licenseKey, process.env.LICENSE_SECRET);
-    } catch (error) {
-      return res.status(401).json({
-        success: false,
-        error: "Invalid license key",
-      });
-    }
+    // Normalize license key (remove spaces, convert to uppercase)
+    const normalizedKey = licenseKey.replace(/\s/g, "").toUpperCase();
 
-    // Get license from database
+    // Get license from database using hashed key
+    const keyHash = hashLicenseKey(normalizedKey);
+
     const { data: license, error: licenseError } = await supabase
       .from("licenses")
       .select("*")
-      .eq("id", licenseData.licenseId)
+      .eq("license_key_hash", keyHash)
       .single();
 
     if (licenseError || !license) {
       return res.status(404).json({
         success: false,
-        error: "License not found",
+        error: "Invalid license key",
       });
     }
 
@@ -376,7 +378,6 @@ app.post("/api/activate", async (req, res) => {
         activated: true,
         licenseType: license.type,
         expiresAt: license.expires_at,
-        features: licenseData.features,
         message: "Device already activated",
       });
     }
@@ -422,7 +423,6 @@ app.post("/api/activate", async (req, res) => {
       activated: true,
       licenseType: license.type,
       expiresAt: license.expires_at,
-      features: licenseData.features,
       activationId: activation.id,
       message: "License activated successfully",
     });
@@ -448,29 +448,21 @@ app.post("/api/validate", async (req, res) => {
       });
     }
 
-    // Verify license signature
-    let licenseData;
-    try {
-      licenseData = jwt.verify(licenseKey, process.env.LICENSE_SECRET);
-    } catch (error) {
-      return res.status(401).json({
-        success: false,
-        error: "Invalid license key",
-        valid: false,
-      });
-    }
+    // Normalize license key
+    const normalizedKey = licenseKey.replace(/\s/g, "").toUpperCase();
+    const keyHash = hashLicenseKey(normalizedKey);
 
     // Get license from database
     const { data: license, error: licenseError } = await supabase
       .from("licenses")
       .select("*")
-      .eq("id", licenseData.licenseId)
+      .eq("license_key_hash", keyHash)
       .single();
 
     if (licenseError || !license) {
       return res.status(404).json({
         success: false,
-        error: "License not found",
+        error: "Invalid license key",
         valid: false,
       });
     }
@@ -539,7 +531,6 @@ app.post("/api/validate", async (req, res) => {
       valid: true,
       licenseType: license.type,
       expiresAt: license.expires_at,
-      features: licenseData.features,
       remainingDays,
       status: license.status,
       lastValidation: activation.last_validation,
@@ -566,11 +557,17 @@ app.post("/api/deactivate", async (req, res) => {
       });
     }
 
-    let licenseData;
-    try {
-      licenseData = jwt.verify(licenseKey, process.env.LICENSE_SECRET);
-    } catch (error) {
-      return res.status(401).json({
+    const normalizedKey = licenseKey.replace(/\s/g, "").toUpperCase();
+    const keyHash = hashLicenseKey(normalizedKey);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("id")
+      .eq("license_key_hash", keyHash)
+      .single();
+
+    if (!license) {
+      return res.status(404).json({
         success: false,
         error: "Invalid license key",
       });
@@ -582,7 +579,7 @@ app.post("/api/deactivate", async (req, res) => {
         is_active: false,
         deactivated_at: new Date().toISOString(),
       })
-      .eq("license_id", licenseData.licenseId)
+      .eq("license_id", license.id)
       .eq("device_id", deviceId);
 
     if (deactivateError) throw deactivateError;
@@ -610,12 +607,8 @@ app.post("/api/license/info", async (req, res) => {
       return res.status(400).json({ error: "License key is required" });
     }
 
-    let licenseData;
-    try {
-      licenseData = jwt.verify(licenseKey, process.env.LICENSE_SECRET);
-    } catch (error) {
-      return res.status(401).json({ error: "Invalid license key" });
-    }
+    const normalizedKey = licenseKey.replace(/\s/g, "").toUpperCase();
+    const keyHash = hashLicenseKey(normalizedKey);
 
     const { data: license, error: licenseError } = await supabase
       .from("licenses")
@@ -630,7 +623,7 @@ app.post("/api/license/info", async (req, res) => {
         )
       `
       )
-      .eq("id", licenseData.licenseId)
+      .eq("license_key_hash", keyHash)
       .single();
 
     if (licenseError || !license) {
@@ -667,22 +660,14 @@ app.post("/api/subscription/cancel", async (req, res) => {
       });
     }
 
-    // Verify license signature
-    let licenseData;
-    try {
-      licenseData = jwt.verify(licenseKey, process.env.LICENSE_SECRET);
-    } catch (error) {
-      return res.status(401).json({
-        success: false,
-        error: "Invalid license key",
-      });
-    }
+    const normalizedKey = licenseKey.replace(/\s/g, "").toUpperCase();
+    const keyHash = hashLicenseKey(normalizedKey);
 
     // Get license from database
     const { data: license, error: licenseError } = await supabase
       .from("licenses")
       .select("*")
-      .eq("id", licenseData.licenseId)
+      .eq("license_key_hash", keyHash)
       .single();
 
     if (licenseError || !license) {
@@ -841,14 +826,12 @@ async function handleSubscriptionCreated(subscription) {
   try {
     console.log("🆕 Processing subscription.created:", subscription.id);
 
-    // Get customer email
     const customerEmail = await getCustomerEmail(subscription.customer_id);
     if (!customerEmail) {
       console.error("Could not fetch customer email");
       return;
     }
 
-    // Cancel any existing active subscriptions for this customer
     await cancelPreviousSubscriptions(customerEmail, subscription.id);
 
     const isTrial = subscription.status === "trialing";
@@ -892,7 +875,6 @@ async function handleSubscriptionUpdated(subscription) {
       status: subscription.status,
     };
 
-    // Handle scheduled cancellation
     if (
       subscription.scheduled_change &&
       subscription.scheduled_change.action === "cancel"
@@ -904,7 +886,6 @@ async function handleSubscriptionUpdated(subscription) {
       updates.scheduled_cancel_at = subscription.scheduled_change.effective_at;
     }
 
-    // Update expires_at
     if (subscription.next_billed_at) {
       updates.expires_at = subscription.next_billed_at;
     } else if (subscription.current_billing_period?.ends_at) {
@@ -994,7 +975,6 @@ async function handleSubscriptionCanceled(subscription) {
         })
         .eq("id", license.id);
 
-      // Deactivate all devices
       await supabase
         .from("activations")
         .update({
@@ -1089,7 +1069,6 @@ async function handleTransactionCompleted(transaction) {
   try {
     console.log("💳 Processing transaction.completed:", transaction.id);
 
-    // For one-time purchases
     if (transaction.billing_period === null) {
       const customerEmail = await getCustomerEmail(transaction.customer_id);
       if (!customerEmail) {
@@ -1116,7 +1095,6 @@ async function handleTransactionCompleted(transaction) {
 async function handleTransactionPaid(transaction) {
   try {
     console.log("💰 Processing transaction.paid:", transaction.id);
-    // Handle successful payment if needed
   } catch (error) {
     console.error("❌ Transaction paid error:", error);
   }
@@ -1133,6 +1111,10 @@ async function createLicense({
   isTrial = false,
   status = "active",
 }) {
+  // Generate short license key
+  const licenseKey = generateLicenseKey();
+  const licenseKeyHash = hashLicenseKey(licenseKey);
+
   const { data: license, error } = await supabase
     .from("licenses")
     .insert([
@@ -1145,6 +1127,7 @@ async function createLicense({
         expires_at: expiresAt,
         max_activations: maxActivations,
         is_trial: isTrial,
+        license_key_hash: licenseKeyHash,
         created_at: new Date().toISOString(),
       },
     ])
@@ -1152,13 +1135,6 @@ async function createLicense({
     .single();
 
   if (error) throw error;
-
-  const licenseKey = generateLicenseKey(license.id, type, expiresAt);
-
-  await supabase
-    .from("licenses")
-    .update({ license_key: licenseKey })
-    .eq("id", license.id);
 
   // Send email with license key
   await sendLicenseEmail(
