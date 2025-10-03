@@ -1,26 +1,31 @@
-const express = require("express");
-const cors = require("cors");
-const helmet = require("helmet");
-const rateLimit = require("express-rate-limit");
-const { createClient } = require("@supabase/supabase-js");
-const crypto = require("crypto");
-const jwt = require("jsonwebtoken");
-const nodemailer = require("nodemailer");
-require("dotenv").config();
+import { createClient } from "@supabase/supabase-js";
+import cors from "cors";
+import { createHmac, timingSafeEqual } from "crypto";
+import dotenv from "dotenv";
+import express from "express";
+import rateLimit from "express-rate-limit";
+import helmet from "helmet";
+import jwt from "jsonwebtoken";
+import nodemailer from "nodemailer";
+
+// Load env vars
+dotenv.config();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
+const paddleUrl = process.env.PADDLE_URL || "https://sandbox-api.paddle.com";
 
 // Initialize Supabase
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY // ✅ Full access, bypasses RLS
+  process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
 // Email transporter
 const emailTransporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: process.env.SMTP_PORT,
-  secure: false, // use TLS
+  secure: false,
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS,
@@ -37,14 +42,14 @@ app.use(
 app.use(
   cors({
     origin: process.env.ALLOWED_ORIGINS?.split(",") || [
-      "http://localhost:3000",
-      "http://localhost:3001",
-      "https://yourdomain.com",
+      "http://localhost:9002",
     ],
     credentials: true,
   })
 );
+
 app.set("trust proxy", 1);
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -52,6 +57,105 @@ const limiter = rateLimit({
   message: { error: "Too many requests, please try again later." },
 });
 app.use(limiter);
+
+// Paddle Webhook Handler
+app.post(
+  "/webhook/paddle",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      if (!Buffer.isBuffer(req.body)) {
+        console.error("Request body is not a buffer", req.body);
+        return res.status(500).json({ error: "Server misconfigured" });
+      }
+
+      // 1. Get Paddle-Signature header
+      const paddleSignature = req.headers["paddle-signature"];
+      const secretKey = process.env.PADDLE_NOTIFICATION_SECRET;
+
+      if (!paddleSignature) {
+        console.error("Paddle-Signature not present in request headers");
+        return res.status(400).json({ error: "Invalid request" });
+      }
+
+      if (!secretKey) {
+        console.error("Secret key not defined");
+        return res.status(500).json({ error: "Server misconfigured" });
+      }
+
+      // 2. Extract timestamp and signature from header
+      if (!paddleSignature.includes(";")) {
+        console.error("Invalid Paddle-Signature format");
+        return res.status(400).json({ error: "Invalid request" });
+      }
+
+      const parts = paddleSignature.split(";");
+      if (parts.length !== 2) {
+        console.error("Invalid Paddle-Signature format");
+        return res.status(400).json({ error: "Invalid request" });
+      }
+
+      const [timestampPart, signaturePart] = parts.map(
+        (part) => part.split("=")[1]
+      );
+
+      if (!timestampPart || !signaturePart) {
+        console.error(
+          "Unable to extract timestamp or signature from Paddle-Signature header"
+        );
+        return res.status(400).json({ error: "Invalid request" });
+      }
+
+      const timestamp = timestampPart;
+      const signature = signaturePart;
+
+      // 3. Check timestamp (optional but recommended)
+      const timestampInt = parseInt(timestamp) * 1000;
+      if (isNaN(timestampInt)) {
+        console.error("Invalid timestamp format");
+        return res.status(400).json({ error: "Invalid request" });
+      }
+
+      const currentTime = Date.now();
+      if (currentTime - timestampInt > 5000) {
+        console.error(
+          "Webhook event expired (timestamp is over 5 seconds old):",
+          timestampInt,
+          currentTime
+        );
+        return res.status(408).json({ error: "Event expired" });
+      }
+
+      // 4. Build signed payload
+      const bodyRaw = req.body.toString();
+      const signedPayload = `${timestamp}:${bodyRaw}`;
+
+      // 5. Hash signed payload using HMAC SHA256
+      const hashedPayload = createHmac("sha256", secretKey)
+        .update(signedPayload, "utf8")
+        .digest("hex");
+
+      // 6. Compare signatures
+      if (
+        !timingSafeEqual(Buffer.from(hashedPayload), Buffer.from(signature))
+      ) {
+        console.error("Computed signature does not match Paddle signature");
+        return res.status(401).json({ error: "Invalid signature" });
+      }
+
+      // 7. Process the webhook event
+      const event = JSON.parse(bodyRaw);
+      await handleWebhookEvent(event);
+
+      res.status(200).json({ received: true });
+    } catch (error) {
+      console.error("Failed to verify and process Paddle webhook:", error);
+      res.status(500).json({
+        error: "Failed to verify and process Paddle webhook",
+      });
+    }
+  }
+);
 
 app.use(express.json());
 
@@ -61,7 +165,7 @@ const generateLicenseKey = (licenseId, type, expiryDate) => {
     licenseId,
     type,
     issuedAt: new Date().toISOString(),
-    expiryDate: expiryDate ? expiryDate.toISOString() : null,
+    expiryDate: expiryDate ? expiryDate : null,
     features: {
       aiGeneration: true,
       premiumTemplates: true,
@@ -73,55 +177,12 @@ const generateLicenseKey = (licenseId, type, expiryDate) => {
   return jwt.sign(licenseData, process.env.LICENSE_SECRET);
 };
 
-function verifyWebhookSignature(signatureHeader, rawBody) {
-  try {
-    if (!signatureHeader) {
-      console.error("Missing Paddle-Signature header");
-      return false;
-    }
-
-    // Parse key=value pairs
-    const parts = Object.fromEntries(
-      signatureHeader.split(";").map((p) => p.split("="))
-    );
-    const { t: timestamp, v1: signatureHex } = parts;
-
-    if (!timestamp || !signatureHex) {
-      console.error("Invalid Paddle-Signature format", parts);
-      return false;
-    }
-
-    // Freshness check (5 minutes)
-    const now = Math.floor(Date.now() / 1000);
-    if (now - parseInt(timestamp, 10) > 300) {
-      console.error("Expired webhook (older than 5 min)");
-      return false;
-    }
-
-    // Reconstruct signed payload
-    const signedPayload = `${timestamp}:${rawBody}`;
-
-    // Compute expected signature with your notification secret
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.PADDLE_NOTIFICATION_SECRET) // <- your pdl_ntfset_... key
-      .update(signedPayload, "utf8")
-      .digest("hex");
-
-    return crypto.timingSafeEqual(
-      Buffer.from(signatureHex, "hex"),
-      Buffer.from(expectedSignature, "hex")
-    );
-  } catch (err) {
-    console.error("Signature verification failed:", err.message);
-    return false;
-  }
-}
-
 const sendLicenseEmail = async (
   email,
   licenseKey,
   isTrial = false,
-  customerName = ""
+  customerName = "",
+  trialEndDate = null
 ) => {
   try {
     const subject = isTrial
@@ -132,9 +193,11 @@ const sendLicenseEmail = async (
       ? `
       <p>Your <strong>7-day free trial</strong> has been activated. After the trial period, 
       your subscription will automatically continue unless canceled.</p>
-      <p><strong>Trial End Date:</strong> ${new Date(
-        Date.now() + 7 * 24 * 60 * 60 * 1000
-      ).toLocaleDateString()}</p>
+      <p><strong>Trial End Date:</strong> ${
+        trialEndDate
+          ? new Date(trialEndDate).toLocaleDateString()
+          : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toLocaleDateString()
+      }</p>
     `
       : "";
 
@@ -196,6 +259,28 @@ const sendLicenseEmail = async (
   }
 };
 
+// Helper function to get customer email from Paddle
+const getCustomerEmail = async (customerId) => {
+  try {
+    console.log(`${paddleUrl}/customers/${customerId}`);
+    const response = await fetch(`${paddleUrl}/customers/${customerId}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.PADDLE_API_KEY}`,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch customer: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.data?.email || null;
+  } catch (error) {
+    console.error("Error fetching customer email:", error);
+    return null;
+  }
+};
+
 // Routes
 app.get("/health", (req, res) => {
   res.json({
@@ -209,7 +294,6 @@ app.get("/health", (req, res) => {
 app.post("/api/activate", async (req, res) => {
   try {
     const { licenseKey, deviceId, deviceInfo } = req.body;
-
     if (!licenseKey || !deviceId) {
       return res.status(400).json({
         success: false,
@@ -627,7 +711,7 @@ app.post("/api/subscription/cancel", async (req, res) => {
     // Cancel subscription via Paddle API
     try {
       const paddleResponse = await fetch(
-        `https://api.paddle.com/subscriptions/${license.subscription_id}/cancel`,
+        `${paddleUrl}/subscriptions/${license.subscription_id}/cancel`,
         {
           method: "POST",
           headers: {
@@ -635,7 +719,7 @@ app.post("/api/subscription/cancel", async (req, res) => {
             "Content-Type": "application/json",
           },
           body: JSON.stringify({
-            effective_from: "next_billing_period", // or "immediately"
+            effective_from: "next_billing_period",
           }),
         }
       );
@@ -679,9 +763,6 @@ app.post("/api/subscription/cancel", async (req, res) => {
       })
       .eq("license_id", license.id);
 
-    // Send cancellation confirmation email
-    await sendCancellationEmail(license.customer_email, license.customer_name);
-
     res.json({
       success: true,
       message: "Subscription canceled successfully",
@@ -696,119 +777,403 @@ app.post("/api/subscription/cancel", async (req, res) => {
   }
 });
 
-// Add cancellation email function
-const sendCancellationEmail = async (email, customerName = "") => {
-  try {
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <style>
-          body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-          .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-          .button { display: inline-block; padding: 12px 24px; background: #007bff; color: white; 
-                   text-decoration: none; border-radius: 5px; margin: 10px 0; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <h2>Subscription Canceled</h2>
-          <p>Dear ${customerName || "Customer"},</p>
-          
-          <p>Your Manga AI Studio subscription has been canceled as requested.</p>
-          
-          <p><strong>What happens next:</strong></p>
-          <ul>
-            <li>You'll continue to have access until the end of your current billing period</li>
-            <li>No further charges will be made</li>
-            <li>Your license will expire at the end of the billing period</li>
-          </ul>
-
-          <p>We're sorry to see you go! If you change your mind, you can resubscribe at any time.</p>
-
-          <a href="https://yourdomain.com/pricing" class="button">View Plans</a>
-
-          <p><strong>Need Help?</strong><br>
-          Contact our support team: support@yourdomain.com</p>
-
-          <p>Best regards,<br>The Manga AI Team</p>
-        </div>
-      </body>
-      </html>
-    `;
-
-    await emailTransporter.sendMail({
-      from: `"Manga AI Studio" <${process.env.SMTP_FROM}>`,
-      to: email,
-      subject: "Your Manga AI Studio Subscription Has Been Canceled",
-      html: html,
-    });
-
-    console.log(`Cancellation email sent to ${email}`);
-  } catch (error) {
-    console.error("Cancellation email error:", error);
-  }
-};
-
-// Paddle Webhook Handler
-app.post(
-  "/webhook/paddle",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
-    try {
-      const signatureHeader = req.headers["paddle-signature"];
-      const rawBody = req.body.toString("utf8");
-      const secretKey = process.env.PADDLE_NOTIFICATION_SECRET;
-
-      if (!signatureHeader || !rawBody) {
-        return res.status(400).json({ error: "Missing signature or body" });
-      }
-
-      const eventData = await paddle.webhooks.unmarshal(
-        rawBody,
-        secretKey,
-        signatureHeader
-      );
-
-      console.log("✅ Webhook verified:", eventData.eventType);
-
-      handleWebhookEvent(eventData);
-
-      res.status(200).json({ received: true });
-    } catch (error) {
-      console.error("❌ Webhook error:", error.message);
-      res.status(200).json({ error: "Webhook processing failed" });
-    }
-  }
-);
-
 // Webhook Event Handler
 async function handleWebhookEvent(event) {
-  switch (event.event_type) {
-    case "subscription.created":
-      await handleSubscriptionCreated(event.data);
-      break;
-    case "subscription.updated":
-      await handleSubscriptionUpdated(event.data);
-      break;
-    case "subscription.canceled":
-      await handleSubscriptionCanceled(event.data);
-      break;
-    case "subscription.past_due":
-      await handleSubscriptionPaymentFailed(event.data);
-      break;
-    case "transaction.completed":
-      await handleTransactionCompleted(event.data);
-      break;
-    default:
-      console.log("Unhandled event:", event.event_type);
+  console.log(
+    "📥 Received webhook event:",
+    event.event_type,
+    "ID:",
+    event.event_id
+  );
+
+  try {
+    switch (event.event_type) {
+      case "subscription.created":
+        await handleSubscriptionCreated(event.data);
+        break;
+
+      case "subscription.updated":
+        await handleSubscriptionUpdated(event.data);
+        break;
+
+      case "subscription.activated":
+        await handleSubscriptionActivated(event.data);
+        break;
+
+      case "subscription.trialing":
+        await handleSubscriptionTrialing(event.data);
+        break;
+
+      case "subscription.canceled":
+        await handleSubscriptionCanceled(event.data);
+        break;
+
+      case "subscription.past_due":
+        await handleSubscriptionPastDue(event.data);
+        break;
+
+      case "subscription.paused":
+        await handleSubscriptionPaused(event.data);
+        break;
+
+      case "subscription.resumed":
+        await handleSubscriptionResumed(event.data);
+        break;
+
+      case "transaction.completed":
+        await handleTransactionCompleted(event.data);
+        break;
+
+      case "transaction.paid":
+        await handleTransactionPaid(event.data);
+        break;
+
+      default:
+        console.log("⚠️ Unhandled event type:", event.event_type);
+    }
+  } catch (error) {
+    console.error(`❌ Error handling ${event.event_type}:`, error);
+    throw error;
   }
 }
 
-// Add this helper function to cancel previous subscriptions
+async function handleSubscriptionCreated(subscription) {
+  try {
+    console.log("🆕 Processing subscription.created:", subscription.id);
+
+    // Get customer email
+    const customerEmail = await getCustomerEmail(subscription.customer_id);
+    if (!customerEmail) {
+      console.error("Could not fetch customer email");
+      return;
+    }
+
+    // Cancel any existing active subscriptions for this customer
+    await cancelPreviousSubscriptions(customerEmail, subscription.id);
+
+    const isTrial = subscription.status === "trialing";
+    const expiresAt = isTrial
+      ? subscription.current_billing_period?.ends_at
+      : subscription.next_billed_at;
+
+    await createLicense({
+      type: "subscription",
+      customerEmail: customerEmail,
+      customerName: "",
+      subscriptionId: subscription.id,
+      expiresAt: expiresAt,
+      maxActivations: 3,
+      isTrial: isTrial,
+      status: subscription.status,
+    });
+
+    console.log(`✅ Subscription license created for ${customerEmail}`);
+  } catch (error) {
+    console.error("❌ Subscription created error:", error);
+  }
+}
+
+async function handleSubscriptionUpdated(subscription) {
+  try {
+    console.log("🔄 Processing subscription.updated:", subscription.id);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("subscription_id", subscription.id)
+      .single();
+
+    if (!license) {
+      console.log("⚠️ License not found for subscription:", subscription.id);
+      return;
+    }
+
+    const updates = {
+      status: subscription.status,
+    };
+
+    // Handle scheduled cancellation
+    if (
+      subscription.scheduled_change &&
+      subscription.scheduled_change.action === "cancel"
+    ) {
+      console.log(
+        "⏰ Subscription has scheduled cancellation:",
+        subscription.scheduled_change.effective_at
+      );
+      updates.scheduled_cancel_at = subscription.scheduled_change.effective_at;
+    }
+
+    // Update expires_at
+    if (subscription.next_billed_at) {
+      updates.expires_at = subscription.next_billed_at;
+    } else if (subscription.current_billing_period?.ends_at) {
+      updates.expires_at = subscription.current_billing_period.ends_at;
+    }
+
+    await supabase.from("licenses").update(updates).eq("id", license.id);
+
+    console.log(
+      `✅ License updated for subscription ${subscription.id}, status: ${subscription.status}`
+    );
+  } catch (error) {
+    console.error("❌ Subscription updated error:", error);
+  }
+}
+
+async function handleSubscriptionActivated(subscription) {
+  try {
+    console.log("✅ Processing subscription.activated:", subscription.id);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("subscription_id", subscription.id)
+      .single();
+
+    if (license) {
+      await supabase
+        .from("licenses")
+        .update({
+          status: "active",
+          expires_at: subscription.next_billed_at,
+        })
+        .eq("id", license.id);
+
+      console.log(`✅ License activated for subscription ${subscription.id}`);
+    }
+  } catch (error) {
+    console.error("❌ Subscription activated error:", error);
+  }
+}
+
+async function handleSubscriptionTrialing(subscription) {
+  try {
+    console.log("🧪 Processing subscription.trialing:", subscription.id);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("subscription_id", subscription.id)
+      .single();
+
+    if (license) {
+      await supabase
+        .from("licenses")
+        .update({
+          status: "trialing",
+          expires_at: subscription.current_billing_period?.ends_at,
+        })
+        .eq("id", license.id);
+
+      console.log(
+        `✅ License set to trialing for subscription ${subscription.id}`
+      );
+    }
+  } catch (error) {
+    console.error("❌ Subscription trialing error:", error);
+  }
+}
+
+async function handleSubscriptionCanceled(subscription) {
+  try {
+    console.log("❌ Processing subscription.canceled:", subscription.id);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("subscription_id", subscription.id)
+      .single();
+
+    if (license) {
+      await supabase
+        .from("licenses")
+        .update({
+          status: "canceled",
+          canceled_at: subscription.canceled_at || new Date().toISOString(),
+        })
+        .eq("id", license.id);
+
+      // Deactivate all devices
+      await supabase
+        .from("activations")
+        .update({
+          is_active: false,
+          deactivated_at: new Date().toISOString(),
+        })
+        .eq("license_id", license.id);
+
+      console.log(`✅ Subscription canceled for ${license.customer_email}`);
+    }
+  } catch (error) {
+    console.error("❌ Subscription canceled error:", error);
+  }
+}
+
+async function handleSubscriptionPastDue(subscription) {
+  try {
+    console.log("⚠️ Processing subscription.past_due:", subscription.id);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("subscription_id", subscription.id)
+      .single();
+
+    if (license) {
+      await supabase
+        .from("licenses")
+        .update({ status: "past_due" })
+        .eq("id", license.id);
+
+      console.log(`⚠️ Payment failed for ${license.customer_email}`);
+    }
+  } catch (error) {
+    console.error("❌ Subscription past_due error:", error);
+  }
+}
+
+async function handleSubscriptionPaused(subscription) {
+  try {
+    console.log("⏸️ Processing subscription.paused:", subscription.id);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("subscription_id", subscription.id)
+      .single();
+
+    if (license) {
+      await supabase
+        .from("licenses")
+        .update({
+          status: "paused",
+          paused_at: subscription.paused_at || new Date().toISOString(),
+        })
+        .eq("id", license.id);
+
+      console.log(`⏸️ Subscription paused for ${license.customer_email}`);
+    }
+  } catch (error) {
+    console.error("❌ Subscription paused error:", error);
+  }
+}
+
+async function handleSubscriptionResumed(subscription) {
+  try {
+    console.log("▶️ Processing subscription.resumed:", subscription.id);
+
+    const { data: license } = await supabase
+      .from("licenses")
+      .select("*")
+      .eq("subscription_id", subscription.id)
+      .single();
+
+    if (license) {
+      await supabase
+        .from("licenses")
+        .update({
+          status: "active",
+          paused_at: null,
+        })
+        .eq("id", license.id);
+
+      console.log(`▶️ Subscription resumed for ${license.customer_email}`);
+    }
+  } catch (error) {
+    console.error("❌ Subscription resumed error:", error);
+  }
+}
+
+async function handleTransactionCompleted(transaction) {
+  try {
+    console.log("💳 Processing transaction.completed:", transaction.id);
+
+    // For one-time purchases
+    if (transaction.billing_period === null) {
+      const customerEmail = await getCustomerEmail(transaction.customer_id);
+      if (!customerEmail) {
+        console.error("Could not fetch customer email");
+        return;
+      }
+
+      await createLicense({
+        type: "one_time",
+        customerEmail: customerEmail,
+        customerName: "",
+        transactionId: transaction.id,
+        maxActivations: 1,
+        status: "active",
+      });
+
+      console.log(`✅ One-time license created for ${customerEmail}`);
+    }
+  } catch (error) {
+    console.error("❌ Transaction completed error:", error);
+  }
+}
+
+async function handleTransactionPaid(transaction) {
+  try {
+    console.log("💰 Processing transaction.paid:", transaction.id);
+    // Handle successful payment if needed
+  } catch (error) {
+    console.error("❌ Transaction paid error:", error);
+  }
+}
+
+async function createLicense({
+  type,
+  customerEmail,
+  customerName,
+  transactionId = null,
+  subscriptionId = null,
+  expiresAt = null,
+  maxActivations,
+  isTrial = false,
+  status = "active",
+}) {
+  const { data: license, error } = await supabase
+    .from("licenses")
+    .insert([
+      {
+        type,
+        status,
+        customer_email: customerEmail,
+        transaction_id: transactionId,
+        subscription_id: subscriptionId,
+        expires_at: expiresAt,
+        max_activations: maxActivations,
+        is_trial: isTrial,
+        created_at: new Date().toISOString(),
+      },
+    ])
+    .select()
+    .single();
+
+  if (error) throw error;
+
+  const licenseKey = generateLicenseKey(license.id, type, expiresAt);
+
+  await supabase
+    .from("licenses")
+    .update({ license_key: licenseKey })
+    .eq("id", license.id);
+
+  // Send email with license key
+  await sendLicenseEmail(
+    customerEmail,
+    licenseKey,
+    isTrial,
+    customerName,
+    expiresAt
+  );
+
+  return licenseKey;
+}
+
 async function cancelPreviousSubscriptions(customerEmail, newSubscriptionId) {
   try {
-    // Find all active subscriptions for this customer
     const { data: existingLicenses, error } = await supabase
       .from("licenses")
       .select("*")
@@ -825,12 +1190,10 @@ async function cancelPreviousSubscriptions(customerEmail, newSubscriptionId) {
       );
 
       for (const license of existingLicenses) {
-        // Cancel the subscription via Paddle API
         if (license.subscription_id) {
           try {
-            // Call Paddle API to cancel subscription
             const paddleResponse = await fetch(
-              `https://api.paddle.com/subscriptions/${license.subscription_id}/cancel`,
+              `${paddleUrl}/subscriptions/${license.subscription_id}/cancel`,
               {
                 method: "POST",
                 headers: {
@@ -856,7 +1219,6 @@ async function cancelPreviousSubscriptions(customerEmail, newSubscriptionId) {
           }
         }
 
-        // Update license status in database
         await supabase
           .from("licenses")
           .update({
@@ -865,7 +1227,6 @@ async function cancelPreviousSubscriptions(customerEmail, newSubscriptionId) {
           })
           .eq("id", license.id);
 
-        // Deactivate all devices for this license
         await supabase
           .from("activations")
           .update({
@@ -879,165 +1240,7 @@ async function cancelPreviousSubscriptions(customerEmail, newSubscriptionId) {
     }
   } catch (error) {
     console.error("Error canceling previous subscriptions:", error);
-    // Don't throw - allow new subscription to proceed even if cancellation fails
   }
-}
-function safeDate(value) {
-  if (!value) return null;
-  const d = new Date(value);
-  return isNaN(d.getTime()) ? null : d.toISOString();
-}
-async function handleSubscriptionCreated(subscription) {
-  try {
-    // Cancel any existing active subscriptions for this customer
-    await cancelPreviousSubscriptions(
-      subscription.customer_email,
-      subscription.id
-    );
-
-    const isTrial = subscription.status === "trialing";
-
-    const expiresAt = isTrial
-      ? safeDate(subscription.trial_ends_at)
-      : safeDate(subscription.next_billed_at);
-
-    const licenseKey = await createLicense({
-      type: "subscription",
-      customerEmail: subscription.customer_email,
-      customerName: subscription.customer_name,
-      subscriptionId: subscription.id,
-      expiresAt: expiresAt, // now safe (may be null)
-      maxActivations: 3,
-      isTrial: isTrial,
-      status: "active",
-    });
-
-    console.log(
-      `✅ Subscription license created for ${subscription.customer_email}`
-    );
-  } catch (error) {
-    console.error("❌ Subscription created error:", error);
-  }
-}
-
-async function handleSubscriptionUpdated(subscription) {
-  try {
-    const { data: license } = await supabase
-      .from("licenses")
-      .select("*")
-      .eq("subscription_id", subscription.id)
-      .single();
-
-    if (license) {
-      const updates = {
-        status: subscription.status === "active" ? "active" : "inactive",
-      };
-
-      // safely update expires_at if present
-      const nextBilling = safeDate(subscription.next_billed_at);
-      if (nextBilling) {
-        updates.expires_at = nextBilling;
-      }
-
-      await supabase.from("licenses").update(updates).eq("id", license.id);
-    }
-  } catch (error) {
-    console.error("❌ Subscription updated error:", error);
-  }
-}
-
-async function handleSubscriptionCanceled(subscription) {
-  try {
-    await supabase
-      .from("licenses")
-      .update({
-        status: "canceled",
-        canceled_at: new Date().toISOString(),
-      })
-      .eq("subscription_id", subscription.id);
-
-    console.log(`⚠️ Subscription canceled for ${subscription.customer_email}`);
-  } catch (error) {
-    console.error("❌ Subscription canceled error:", error);
-  }
-}
-
-async function handleSubscriptionPaymentFailed(subscription) {
-  try {
-    await supabase
-      .from("licenses")
-      .update({ status: "past_due" })
-      .eq("subscription_id", subscription.id);
-
-    console.log(`⚠️ Payment failed for ${subscription.customer_email}`);
-  } catch (error) {
-    console.error("❌ Subscription payment failed error:", error);
-  }
-}
-
-async function handleTransactionCompleted(transaction) {
-  try {
-    if (transaction.type === "one_time") {
-      const licenseKey = await createLicense({
-        type: "one_time",
-        customerEmail: transaction.customer_email,
-        customerName: transaction.customer_name,
-        transactionId: transaction.id,
-        maxActivations: 1,
-        status: "active",
-      });
-
-      console.log(
-        `✅ One-time license created for ${transaction.customer_email}`
-      );
-    }
-  } catch (error) {
-    console.error("❌ Transaction completed error:", error);
-  }
-}
-
-async function createLicense({
-  type,
-  customerEmail,
-  customerName,
-  transactionId,
-  subscriptionId,
-  expiresAt,
-  maxActivations,
-  isTrial = false,
-  status = "active",
-}) {
-  const { data: license, error } = await supabase
-    .from("licenses")
-    .insert([
-      {
-        type,
-        status,
-        customer_email: customerEmail,
-        transaction_id: transactionId,
-        subscription_id: subscriptionId,
-        expires_at: expiresAt ? expiresAt.toISOString() : null,
-        max_activations: maxActivations,
-        is_trial: isTrial,
-        created_at: new Date().toISOString(),
-      },
-    ])
-    .select()
-    .single();
-
-  if (error) throw error;
-
-  const licenseKey = generateLicenseKey(license.id, type, expiresAt);
-
-  await supabase
-    .from("licenses")
-    .update({ license_key: licenseKey })
-    .eq("id", license.id);
-
-  // Send email with license key
-  await sendLicenseEmail(customerEmail, licenseKey, isTrial, customerName);
-
-  return licenseKey;
 }
 
 // Error handling
